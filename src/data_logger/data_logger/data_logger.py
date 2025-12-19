@@ -1,19 +1,24 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32  # masih boleh dipakai kalau mau log battery_voltage global
-from my_msg.msg import Arus, Volt  # <-- import custom message
+from std_msgs.msg import Float32
+from my_msg.msg import Arus, Volt
+
 import csv
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 
 LEG_JOINTS = [
     "r_hip_yaw", "r_hip_roll", "r_hip_pitch", "r_ank_pitch", "r_ank_roll",
     "l_hip_yaw", "l_hip_roll", "l_hip_pitch", "l_ank_pitch", "l_ank_roll"
 ]
 
-# Mapping nama joint -> field di my_msg/Arus dan my_msg/Volt
-JOINT_TO_ARUS_FIELD = {
+JOINT_TO_FIELD = {
     "r_hip_yaw":   "id7",
     "l_hip_yaw":   "id8",
     "r_hip_roll":  "id9",
@@ -26,208 +31,165 @@ JOINT_TO_ARUS_FIELD = {
     "l_ank_roll":  "id18",
 }
 
-JOINT_TO_VOLT_FIELD = {
-    "r_hip_yaw":   "id7",
-    "l_hip_yaw":   "id8",
-    "r_hip_roll":  "id9",
-    "l_hip_roll":  "id10",
-    "r_hip_pitch": "id11",
-    "l_hip_pitch": "id12",
-    "r_ank_pitch": "id15",
-    "l_ank_pitch": "id16",
-    "r_ank_roll":  "id17",
-    "l_ank_roll":  "id18",
-}
-
-# Konversi satuan current raw Dynamixel -> Ampere (XM series: 2.69 mA / LSB)
-CURRENT_RAW_TO_AMP = 0.00269
+DEFAULT_CURRENT_SCALE = 0.00269
 
 
 class DataLogger(Node):
-
     def __init__(self):
         super().__init__('data_logger_node')
 
-        # Menyimpan message terakhir dari /robotis/arus dan /robotis/volt
-        self.current_arus_msg = None
-        self.current_volt_msg = None
+        # Params
+        self.declare_parameter('output_dir', os.path.join(os.path.expanduser('~'), 'data_pengujian'))
+        self.declare_parameter('output_filename', '')
+        self.declare_parameter('log_hz', 10.0)
+        self.declare_parameter('flush_every_n', 50)
+        self.declare_parameter('include_battery', True)
+        self.declare_parameter('current_scale', DEFAULT_CURRENT_SCALE)
+        self.declare_parameter('volt_scale', 0.1)  # kamu pakai 0.1
 
-        # (Opsional) menyimpan tegangan baterai global dari /robotis/battery_voltage
-        self.battery_voltage = 12.0
+        output_dir = self.get_parameter('output_dir').value
+        output_dir = os.path.expanduser(str(output_dir))  # ✅ expand "~"
+        output_filename = str(self.get_parameter('output_filename').value)
 
-        # QoS Profile untuk JointState dari Robot Hardware
-        qos_profile = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT
-        )
+        self.log_hz = float(self.get_parameter('log_hz').value)
+        self.flush_every_n = int(self.get_parameter('flush_every_n').value)
+        self.include_battery = bool(self.get_parameter('include_battery').value)
 
-        # 1. Subscriber Joint State (posisi & kecepatan)
-        self.create_subscription(
-            JointState,
-            '/robotis/present_joint_states',
-            self.joint_state_callback,
-            qos_profile
-        )
+        self.current_scale = float(self.get_parameter('current_scale').value)
+        self.volt_scale = float(self.get_parameter('volt_scale').value)
 
-        # 2. Subscriber Arus per joint dari OpenCR
-        self.create_subscription(
-            Arus,
-            '/robotis/arus',
-            self.arus_callback,
-            10
-        )
+        self.log_period = (1.0 / self.log_hz) if self.log_hz > 0 else 0.0
 
-        # 3. Subscriber Tegangan per joint dari OpenCR
-        self.create_subscription(
-            Volt,
-            '/robotis/volt',
-            self.volt_callback,
-            10
-        )
+        # Cache
+        self.arus_msg = None
+        self.volt_msg = None
+        self.have_current = False
+        self.have_voltage = False
 
-        # (Opsional) kalau masih ingin log tegangan baterai global
-        self.create_subscription(
-            Float32,
-            '/robotis/battery_voltage',
-            self.battery_voltage_callback,
-            10
-        )
+        self.battery_voltage = 0.0
+        self.have_battery = False
 
-        # Inisialisasi file CSV
-        home_dir = os.path.expanduser('~')
-        output_filename = os.path.join(home_dir, 'data_skripsi_berdiri.csv')
+        self.last_log_time_epoch = None
+        self.t0_epoch = None
 
-        try:
-            self.csv_file = open(output_filename, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
+        self.tz = ZoneInfo("Asia/Jakarta")
+        self.row_count = 0
 
-            # Header CSV
-            self.csv_writer.writerow([
-                'timestamp_sec',
-                'timestamp_nanosec',
-                'joint_name',
-                'position_rad',
-                'velocity_rad_s',
-                'current_ampere',   # dari /robotis/arus (sudah dikonversi ke A)
-                'voltage_volt',     # dari /robotis/volt (0.1 * raw)
-                'power_watt',       # V * I per joint
-                'battery_voltage'   # opsional: tegangan baterai global
-            ])
-            self.csv_file.flush()
-            self.get_logger().info(f"Siap merekam Power! File: {output_filename}")
+        # QoS
+        qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        except IOError as e:
-            self.get_logger().error(f"Gagal membuka file CSV: {e}")
-            self.csv_file = None
-            self.csv_writer = None
+        # Subscribers
+        self.create_subscription(JointState, '/robotis/present_joint_states', self.joint_state_callback, qos_profile)
+        self.create_subscription(Arus, '/robotis/arus', self.arus_callback, 10)
+        self.create_subscription(Volt, '/robotis/volt', self.volt_callback, 10)
 
-    # ---------------------- CALLBACK TOPIC ---------------------- #
+        if self.include_battery:
+            self.create_subscription(Float32, '/robotis/battery_voltage', self.battery_callback, 10)
+
+        # CSV
+        os.makedirs(output_dir, exist_ok=True)
+
+        if output_filename:
+            csv_path = os.path.join(output_dir, output_filename)
+        else:
+            ts = datetime.now(self.tz).strftime('%Y%m%d-%H%M%S')
+            csv_path = os.path.join(output_dir, f"data_power_{ts}.csv")
+
+        self.csv_file = open(csv_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+
+        header = [
+            't_rel_s', 'time_iso_wib',
+            'timestamp_sec', 'timestamp_nanosec',
+            'joint_name', 'position_rad', 'velocity_rad_s',
+            'current_ampere', 'voltage_volt', 'power_watt'
+        ]
+        if self.include_battery:
+            header.append('battery_voltage')
+
+        self.csv_writer.writerow(header)
+        self.csv_file.flush()
+
+        self.get_logger().info(f"Data logger siap. Output: {csv_path}")
+        self.get_logger().info(f"Downsampling aktif: log_hz={self.log_hz} Hz (period={self.log_period:.3f}s)")
 
     def arus_callback(self, msg: Arus):
-        """Simpan message arus terakhir dari /robotis/arus."""
-        self.current_arus_msg = msg
+        self.arus_msg = msg
+        self.have_current = True
 
     def volt_callback(self, msg: Volt):
-        """Simpan message tegangan terakhir dari /robotis/volt."""
-        self.current_volt_msg = msg
+        self.volt_msg = msg
+        self.have_voltage = True
 
-    def battery_voltage_callback(self, msg: Float32):
-        """(Opsional) Simpan tegangan baterai global."""
-        self.battery_voltage = msg.data
+    def battery_callback(self, msg: Float32):
+        self.battery_voltage = float(msg.data)
+        self.have_battery = True
 
-    # -------------------- HELPER GETTER ------------------------ #
-
-    def get_current_for_joint(self, joint_name: str) -> float:
-        """
-        Ambil arus joint (dalam Ampere) berdasarkan joint_name
-        dari message /robotis/arus.
-        """
-        if self.current_arus_msg is None:
+    def _get_from_msg(self, msg, joint_name: str) -> float:
+        field = JOINT_TO_FIELD.get(joint_name)
+        if (msg is None) or (field is None):
             return 0.0
-
-        field = JOINT_TO_ARUS_FIELD.get(joint_name, None)
-        if field is None:
-            return 0.0
-
-        # Ambil nilai raw dari field idX
-        raw_value = getattr(self.current_arus_msg, field, 0.0)
-        # Konversi ke Ampere
-        current_ampere = raw_value * CURRENT_RAW_TO_AMP
-        return current_ampere
-
-    def get_voltage_for_joint(self, joint_name: str) -> float:
-        """
-        Ambil tegangan joint (Volt) berdasarkan joint_name
-        dari message /robotis/volt.
-        """
-        if self.current_volt_msg is None:
-            return 0.0
-
-        field = JOINT_TO_VOLT_FIELD.get(joint_name, None)
-        if field is None:
-            return 0.0
-
-        voltage = getattr(self.current_volt_msg, field, 0.0)
-        return voltage
-
-    # ----------------- CALLBACK JOINT STATE --------------------- #
+        return float(getattr(msg, field, 0.0))
 
     def joint_state_callback(self, msg: JointState):
-        if self.csv_writer is None:
+        if not (self.have_current and self.have_voltage):
             return
 
-        stamp_sec = msg.header.stamp.sec
-        stamp_nanosec = msg.header.stamp.nanosec
+        stamp = msg.header.stamp
+        t_epoch = float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
+        if self.t0_epoch is None:
+            self.t0_epoch = t_epoch
+
+        if self.last_log_time_epoch is not None and self.log_period > 0:
+            if (t_epoch - self.last_log_time_epoch) < self.log_period:
+                return
+
+        self.last_log_time_epoch = t_epoch
+        t_rel = t_epoch - self.t0_epoch
+        time_iso_wib = datetime.fromtimestamp(t_epoch, tz=self.tz).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " WIB"
+
+        names = msg.name
+        pos = msg.position
+        vel = msg.velocity
+
+        for i, joint in enumerate(names):
+            if joint not in LEG_JOINTS:
+                continue
+
+            position = float(pos[i]) if i < len(pos) else 0.0
+            velocity = float(vel[i]) if i < len(vel) else 0.0
+
+            raw_i = self._get_from_msg(self.arus_msg, joint)
+            raw_v = self._get_from_msg(self.volt_msg, joint)
+
+            current_a = raw_i * self.current_scale
+            voltage_v = raw_v * self.volt_scale
+            power_w = abs(current_a) * voltage_v
+
+            row = [
+                t_rel, time_iso_wib,
+                stamp.sec, stamp.nanosec,
+                joint, position, velocity,
+                current_a, voltage_v, power_w
+            ]
+            if self.include_battery:
+                row.append(self.battery_voltage if self.have_battery else 0.0)
+
+            self.csv_writer.writerow(row)
+            self.row_count += 1
+
+            if self.flush_every_n > 0 and (self.row_count % self.flush_every_n == 0):
+                self.csv_file.flush()
+
+    def destroy_node(self):
         try:
-            data_recorded = False
-
-            for i in range(len(msg.name)):
-                joint_name = msg.name[i]
-
-                if joint_name in LEG_JOINTS:
-                    position = msg.position[i] if i < len(msg.position) else 0.0
-                    velocity = msg.velocity[i] if i < len(msg.velocity) else 0.0
-
-                    # --- Ambil arus & tegangan dari topic /robotis/arus dan /robotis/volt ---
-                    current = self.get_current_for_joint(joint_name)   # Ampere
-                    voltage = self.get_voltage_for_joint(joint_name)   # Volt
-
-                    # --- Hitung daya per joint ---
-                    power = voltage * abs(current)  # W (asumsi konsumsi -> nilai positif)
-
-                    self.csv_writer.writerow([
-                        stamp_sec,
-                        stamp_nanosec,
-                        joint_name,
-                        position,
-                        velocity,
-                        current,
-                        voltage,
-                        power,
-                        self.battery_voltage  # tegangan baterai global (opsional)
-                    ])
-                    data_recorded = True
-
-            if data_recorded:
-                self.csv_file.flush()
-
-        except Exception as e:
-            self.get_logger().error(f"Error saat menulis data: {e}")
-
-    # ------------------- SHUTDOWN HANDLER ----------------------- #
-
-    def on_shutdown(self):
-        if hasattr(self, 'csv_file') and self.csv_file:
-            self.get_logger().info("Menutup file CSV...")
-            try:
-                self.csv_file.flush()
-            except Exception:
-                pass
+            self.csv_file.flush()
             self.csv_file.close()
-            self.get_logger().info("File CSV ditutup.")
+        except Exception:
+            pass
+        super().destroy_node()
 
-# -------------------------- MAIN ------------------------------- #
 
 def main(args=None):
     rclpy.init(args=args)
@@ -237,10 +199,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.on_shutdown()
+        node.destroy_node()
+        # ✅ jangan shutdown kalau sudah mati
         if rclpy.ok():
-            node.destroy_node()
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

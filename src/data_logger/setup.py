@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'data_logger_node = data_logger.data_logger:main',
             'action_sequencer = data_logger.action_sequencer:main',
+            'event_marker = data_logger.event_marker:main',
         ],
     },
 )
